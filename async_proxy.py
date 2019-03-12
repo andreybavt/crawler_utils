@@ -1,4 +1,3 @@
-import asyncio
 import sys
 import time
 
@@ -13,8 +12,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
-
-from utils import nofail, nofail_async
+from .utils import nofail, nofail_async
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 
