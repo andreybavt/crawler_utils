@@ -146,7 +146,8 @@ def nofail(retries=200, failback_result=None):
                     return func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
+                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
+                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
             if failback_result is not None:
                 return failback_result
             raise Exception(
