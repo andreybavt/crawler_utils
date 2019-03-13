@@ -204,6 +204,7 @@ def read_prop(obj, *args, fallback=None):
     elif len(args) == 1:
         if args[0] not in obj:
             logging.debug(f"property {args[0]} not in object {obj}")
+            return fallback
         return obj.get(args[0])
     else:
         return read_prop(read_prop(obj, args[0]), *args[1:], fallback=fallback)
