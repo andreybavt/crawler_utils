@@ -7,7 +7,6 @@ import json
 import logging
 import os
 import shutil
-import traceback
 
 
 class PersistentSet:
@@ -208,6 +207,11 @@ def read_prop(obj, *args, fallback=None):
         return obj.get(args[0])
     else:
         return read_prop(read_prop(obj, args[0]), *args[1:], fallback=fallback)
+
+
+def get_tasks_results(bulk_await_result, is_json=False):
+    return [i.result().body.decode() if not is_json else json.loads(i.result().body.decode()) for i in
+            bulk_await_result[0]]
 
 
 if __name__ == '__main__':
