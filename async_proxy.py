@@ -12,6 +12,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
+
 from .utils import nofail, nofail_async
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -225,7 +226,7 @@ class ProxyManager(object):
             browser = webdriver.Chrome(options=chrome_options)
 
             for (c_id, c) in enumerate(countries):
-                logging.info(f"      running for {c} ({c_id+1}/{len(countries)}), total fetched: {len(result)}")
+                logging.info(f"      running for {c} ({c_id + 1}/{len(countries)}), total fetched: {len(result)}")
                 c_url = f"https://www.proxynova.com/proxy-server-list/country-{c}"
                 browser.get(c_url)
                 for r in browser.find_elements_by_css_selector("#tbl_proxy_list tr"):
@@ -292,6 +293,7 @@ class AsyncProxyClient(object):
 
     def __init__(self, with_proxy=True, penalty_fn=None) -> None:
         super().__init__()
+        self.fetch_opts = {}
         self.with_client_proxy = with_proxy
         if self.with_client_proxy:
             self.proxy_manager = ProxyManager(penalty_fn)
@@ -316,7 +318,7 @@ class AsyncProxyClient(object):
         try:
             if self.with_client_proxy and use_proxy and not proxy:
                 self.proxy_manager.shuffle_proxy()
-            res = await self.fetch(request, use_proxy=use_proxy, proxy=proxy, **kwargs)
+            res = await self.fetch(request, use_proxy=use_proxy, proxy=proxy, **{**self.fetch_opts, **kwargs})
             return res
         except Exception as e:
             if self.with_client_proxy and use_proxy:
