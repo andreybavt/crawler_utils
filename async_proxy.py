@@ -299,26 +299,39 @@ class AsyncProxyClient(object):
             self.proxy_manager = ProxyManager(penalty_fn)
         self._client = CurlAsyncHTTPClient()
 
-    async def fetch(self, request, use_proxy=True, proxy=None, **kwargs):
-        curr_proxy = None
-        if self.with_client_proxy and use_proxy:
-            self.proxy_manager.shuffle_proxy()
-            curr_proxy = self.proxy_manager.current_proxy if not proxy else proxy
-            request.proxy_host = curr_proxy.ip
-            request.proxy_port = curr_proxy.port
-        request.connect_timeout = kwargs.get('connect_timeout', 10)
-        request.request_timeout = kwargs.get('request_timeout', 60)
-        if self.with_client_proxy and use_proxy:
-            logging.debug(f"using proxy: {curr_proxy}")
-        res = await self._client.fetch(request)
-        return res
+    # async def fetch(self, request, use_proxy=True, proxy=None, **kwargs):
+    #     curr_proxy = None
+    #     if self.with_client_proxy and use_proxy:
+    #         self.proxy_manager.shuffle_proxy()
+    #         curr_proxy = self.proxy_manager.current_proxy if not proxy else proxy
+    #         request.proxy_host = curr_proxy.ip
+    #         request.proxy_port = curr_proxy.port
+    #     request.connect_timeout = kwargs.get('connect_timeout', 10)
+    #     request.request_timeout = kwargs.get('request_timeout', 60)
+    #     if self.with_client_proxy and use_proxy:
+    #         logging.debug(f"using proxy: {curr_proxy}")
+    #     res = await self._client.fetch(request)
+    #     return res
 
     @nofail_async()
     async def patient_fetch(self, request, proxy=None, use_proxy=True, **kwargs):
+        return await self.fetch(request, proxy=proxy, use_proxy=use_proxy, **kwargs)
+
+    async def fetch(self, request, proxy=None, use_proxy=True, **kwargs):
+        curr_proxy = None
+
         try:
             if self.with_client_proxy and use_proxy and not proxy:
                 self.proxy_manager.shuffle_proxy()
-            res = await self.fetch(request, use_proxy=use_proxy, proxy=proxy, **{**self.fetch_opts, **kwargs})
+                curr_proxy = self.proxy_manager.current_proxy if not proxy else proxy
+                request.proxy_host = curr_proxy.ip
+                request.proxy_port = curr_proxy.port
+
+            request.connect_timeout = kwargs.get('connect_timeout', 10)
+            request.request_timeout = kwargs.get('request_timeout', 60)
+            if self.with_client_proxy and use_proxy:
+                logging.debug(f"using proxy: {curr_proxy}")
+            res = await self._client.fetch(request)
             return res
         except Exception as e:
             if self.with_client_proxy and use_proxy:
