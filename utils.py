@@ -6,7 +6,9 @@ import hashlib
 import json
 import logging
 import os
+import random
 import shutil
+from functools import partial
 
 
 class PersistentSet:
@@ -83,6 +85,10 @@ class PersistentSet:
         finally:
             self.locks[bucket].release()
 
+    async def remove(self, value):
+        _, bucket = self.get_hash(str(value))
+        await self.remove_from_bucket(bucket, {value})
+
     async def remove_from_bucket(self, bucket, visited_users_in_bucket_list):
         try:
             await self.locks[bucket].acquire()
@@ -111,7 +117,7 @@ def chunks(l, n):
         yield l[i:i + n]
 
 
-def nofail_async(retries=200, failback_result=None):
+def nofail_async(retries=20, failback_result=None):
     def nofail_async_fn(func):
         async def func_wrapper(*args, **kwargs):
             r = 0
@@ -134,7 +140,7 @@ def nofail_async(retries=200, failback_result=None):
     return nofail_async_fn
 
 
-def nofail(retries=200, failback_result=None):
+def nofail(retries=20, failback_result=None):
     def nofail_async_fn(func):
         def func_wrapper(*args, **kwargs):
             r = 0
@@ -212,6 +218,30 @@ def read_prop(obj, *args, fallback=None):
 def get_tasks_results(bulk_await_result, is_json=False):
     return [i.result().body.decode() if not is_json else json.loads(i.result().body.decode()) for i in
             bulk_await_result[0]]
+
+
+def randomify_url(url) -> str:
+    rand_url = url + "?gqe=" + str(random.randint(0, 10 ** 20))
+    return rand_url
+
+
+class AsyncScheduler:
+
+    def __init__(self, eloop) -> None:
+        super().__init__()
+        self.eloop = eloop
+
+    def run(self, func, *args):
+        self.task = partial(func, args) if len(args) else func
+        return self
+
+    def every(self, delay):
+        async def loop():
+            while True:
+                await asyncio.sleep(delay)
+                self.eloop.create_task(self.task())
+
+        self.eloop.create_task(loop())
 
 
 if __name__ == '__main__':
