@@ -56,3 +56,4 @@ fabric.properties
 .idea
 ghostdriver.log
 proxies.json
+env

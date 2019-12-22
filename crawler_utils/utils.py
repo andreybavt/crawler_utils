@@ -1,14 +1,16 @@
 import asyncio
-import time
-from asyncio import Lock
-
 import hashlib
 import json
 import logging
 import os
 import random
 import shutil
+import time
+import traceback
+from asyncio import Lock
 from functools import partial
+
+SEPARATOR = '\n' + '-' * 100 + '\n'
 
 
 class PersistentSet:
@@ -117,7 +119,25 @@ def chunks(l, n):
         yield l[i:i + n]
 
 
-def nofail_async(retries=20, failback_result=None):
+from json import JSONEncoder
+
+
+class MyEncoder(JSONEncoder):
+    def default(self, o):
+        return o.__dict__ if hasattr(o, '__dict__') else str(o)
+
+
+def to_str(obj):
+    try:
+        return MyEncoder().encode(obj)
+    except Exception:
+        return str(obj)
+
+
+UNDEFINED_FAILBACK_RESULT = "$^!#"
+
+
+def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
     def nofail_async_fn(func):
         async def func_wrapper(*args, **kwargs):
             r = 0
@@ -128,9 +148,12 @@ def nofail_async(retries=20, failback_result=None):
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
-                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
-            if failback_result is not None:
+                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
+                    args_str = '\n\n'.join([to_str(a) for a in args])
+
+                    logging.log(logging.DEBUG if r < retries else logging.WARN,
+                                f"{SEPARATOR}@nofail_async: {func.__name__}, args={args_str}, kwargs={kwargs}\n, {r}/{retries}, {e}\n{traceback.format_exc()}{SEPARATOR}")
+            if failback_result is not UNDEFINED_FAILBACK_RESULT:
                 return failback_result
             raise Exception(
                 f"Exceeded number of retries: {func.__name__}, nb.retries: {retries}, exception: {last_exception} ")
@@ -140,8 +163,8 @@ def nofail_async(retries=20, failback_result=None):
     return nofail_async_fn
 
 
-def nofail(retries=20, failback_result=None):
-    def nofail_async_fn(func):
+def nofail(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
+    def nofail_fn(func):
         def func_wrapper(*args, **kwargs):
             r = 0
             last_exception = None
@@ -151,16 +174,17 @@ def nofail(retries=20, failback_result=None):
                     return func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
-                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
-            if failback_result is not None:
+                    logging.log(logging.DEBUG if r < retries else logging.WARN,
+                                f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
+                    # logging.warning()
+            if failback_result is not UNDEFINED_FAILBACK_RESULT:
                 return failback_result
             raise Exception(
                 f"Exceeded number of retries: {func.__name__}, nb.retries: {retries}, exception: {last_exception} ")
 
         return func_wrapper
 
-    return nofail_async_fn
+    return nofail_fn
 
 
 def measure_async(func):

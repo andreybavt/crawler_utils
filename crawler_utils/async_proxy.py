@@ -1,20 +1,38 @@
+import asyncio
 import json
-import jsonpickle
 import logging
 import os
 import random
 import re
-import requests
 import sys
 import time
 import traceback
 import urllib.parse
+from asyncio import CancelledError
+
+import jsonpickle
+import requests
 from bs4 import BeautifulSoup
-from crawler_utils.utils import nofail, nofail_async
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
 from tornado.httpclient import HTTPRequest
+
+from crawler_utils.utils import nofail, nofail_async, chunks
+
+logging.basicConfig(stream=sys.stdout, level=os.environ.get('LOGLEVEL', 'INFO').upper(),
+                    format='%(name)s: %(asctime)s %(levelname)s %(message)s')
+
+
+class TornadoLoggerFilter(logging.Filter):
+
+    def filter(self, record):
+        if 'Exception after Future was cancelled' in record.msg:
+            return False
+        return record.exc_info[0] != UserCancelException
+
+
+logging.getLogger("tornado.application").addFilter(TornadoLoggerFilter())
 
 
 @nofail(retries=1)
@@ -32,66 +50,99 @@ def create_browser():
 class AsyncProxyClient(object):
     AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient')
 
-    def __init__(self, enable_proxy=True, penalty_fn=None, promote_fn=None) -> None:
+    def __init__(self, enable_proxy=True, penalty_fn=None, promote_fn=None, max_clients=50) -> None:
         super().__init__()
         self.fetch_opts = {}
         self.enable_proxy = enable_proxy
         if self.enable_proxy:
             self.proxy_manager = ProxyManager(penalty_fn, promote_fn)
-        self._client = CurlAsyncHTTPClient()
+        self._client = CurlAsyncHTTPClient(max_clients=max_clients, defaults=dict(validate_cert=False))
 
     @nofail_async()
-    async def patient_fetch(self, request, proxy=None, use_proxy_for_request=True, **kwargs):
-        return await self.fetch(request, proxy=proxy, use_proxy_for_request=use_proxy_for_request, **kwargs)
+    async def patient_fetch(self, request, proxy=None, use_proxy_for_request=True, redundancy=1, **kwargs):
+        return await self.impatient_fetch(request, proxy, use_proxy_for_request, redundancy, **kwargs)
+
+    async def impatient_fetch(self, request, proxy=None, use_proxy_for_request=True, redundancy=1, **kwargs):
+        res = await asyncio.wait(
+            [self.fetch(request, proxy=proxy, use_proxy_for_request=use_proxy_for_request, **kwargs) for _ in
+             range(redundancy)], return_when=asyncio.FIRST_COMPLETED)
+        for task in [j for e in res for j in e if not j.done()]:
+            task.cancel()
+        result = [j for e in res for j in e if j.done()][0].result()
+        return result
 
     async def fetch(self, request: HTTPRequest, proxy=None, use_proxy_for_request=True, **kwargs):
         ok_statuses = set([200] + kwargs.get('ok_statuses', []))
         logging.debug(f"Sending {request.method} : {request.url}")
+        if kwargs.get('cookies'):
+            cookies = request.headers.get('Cookie', '')
+            cookies += ';'.join([f'{i[0]}:{i[1]}' for i in kwargs.get('cookies').items()])
+            request.headers['Cookie'] = cookies
         is_proxying = self.enable_proxy and use_proxy_for_request
+        curr_proxy = None
         try:
             if is_proxying:
+                while not self.proxy_manager.has_proxies():
+                    await asyncio.sleep(1)
                 self.proxy_manager.shuffle_proxy()
                 curr_proxy: Proxy = self.proxy_manager.current_proxy if not proxy else proxy
                 request.proxy_host = curr_proxy.ip
                 request.proxy_port = curr_proxy.port
+                if curr_proxy.username:
+                    request.proxy_username = curr_proxy.username
+                if curr_proxy.password:
+                    request.proxy_password = curr_proxy.password
 
             request.connect_timeout = kwargs.get('connect_timeout', 10)
             request.request_timeout = kwargs.get('request_timeout', 60)
-            if is_proxying:
+            if is_proxying and curr_proxy:
                 logging.debug(f"using proxy: {curr_proxy.ip}")
+
             res = await self._client.fetch(request, raise_error=False)
             if res.code not in ok_statuses:
-                raise Exception(f"Bad HTTP response code: {res.code}")
+                raise BadResponseCodeException(res.code)
             if is_proxying:
                 self.proxy_manager.promote_proxy(curr_proxy)
             return res
+        except CancelledError:
+            pass
         except Exception as e:
             if is_proxying:
-                self.proxy_manager.punish_proxy(curr_proxy, e)
+                await self.proxy_manager.punish_proxy(curr_proxy, e)
             raise e
 
 
 class Proxy(object):
     UNKNOWN = '¯\\_(ツ)_/¯'
 
-    def __init__(self, ip, port, c_code=UNKNOWN, country=UNKNOWN) -> None:
+    def __init__(self, ip, port, c_code=UNKNOWN, country=UNKNOWN, username=None, password=None) -> None:
         super().__init__()
         self.ip = ip
         self.port = port
         self.c_code = c_code
         self.country = country
+        self.username = username
+        self.password = password
 
     def __repr__(self) -> str:
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True)
 
 
 class ProxyManager(object):
+    def __init__(self, penalty_fn=None, promote_fn=None) -> None:
+        super().__init__()
+        self.initializing_proxies = False
+        self._proxy_list = []
+        self.current_proxy = None
+        asyncio.get_event_loop().run_until_complete(self.initialize_proxy_list(force=False))
+        self.shuffle_proxy()
+        self.penalty_fn = penalty_fn if penalty_fn is not None else self.default_penalty_fn
+        self.promote_fn = promote_fn if promote_fn is not None else self.default_promote_fn
 
-    @classmethod
-    def fetch_proxies(cls, https_only=False, force=False):
+    async def fetch_proxies(self, https_only=False, force=False):
         from datetime import date
         # proxy_file_path = os.path.join(os.path.dirname(__file__), "proxies.json")
-        proxy_file_path = "proxies.json"
+        proxy_file_path = "../proxies.json"
         all_found_proxies_result = []
         if not force and os.path.exists(proxy_file_path):
             with open(proxy_file_path, "r") as f:
@@ -133,13 +184,19 @@ class ProxyManager(object):
 
                         # browser.get(
                         #     f"http://proxydb.net/?protocol=https&min_uptime=80&max_response_time=4&country={c}&offset={i}")
+                        if not len(html):
+                            logging.info(f"Empty response page for {c}")
+                            break
                         if "No proxies found. Try other filter settings or" in html:
                             break
                         soup = BeautifulSoup(html, 'lxml')
                         table_el = soup.select_one(".table-responsive")
-                        data_key_attrs = [e for e in soup.select('div') if
-                                          len(list(filter(lambda x: x.startswith('data-'), e.attrs.keys())))][
-                            0].attrs
+                        data_divs = [e for e in soup.select('div') if
+                                     len(list(filter(lambda x: x.startswith('data-'), e.attrs.keys())))]
+                        if len(data_divs) == 0:
+                            logging.info(f"No data_divs found for {c}")
+                            break
+                        data_key_attrs = data_divs[0].attrs
                         for (k, v) in data_key_attrs.items():
                             if k.startswith('data-'):
                                 data_key = v
@@ -233,6 +290,48 @@ class ProxyManager(object):
                 result.append(Proxy(ip=p.split(':')[0], port=int(p.split(':')[1])))
 
             logging.info(f"Found {len(result)} proxies with a2u")
+            return result
+
+        @nofail_async(retries=3, failback_result=[])
+        async def fetch_proxyrotator():
+            result = []
+            client = AsyncHTTPClient()
+
+            async def fetch_proxy(i):
+                logging.info(f'fetching froxy #{i} from proxyrotator')
+                resp = await client.fetch(HTTPRequest(method='GET',
+                                                      url='http://falcon.proxyrotator.com:51337/?apiKey=9EKVT48tBSANFXkxWbeMhCUZqwzypfPa&get=true&post=true'))
+                data = json.loads(resp.body.decode())
+                result.append(
+                    Proxy(ip=data['ip'], port=int(data['port']), c_code=data['country'], country=data['country']))
+
+            for chunk in chunks(range(300), 10):
+                await asyncio.wait([fetch_proxy(i) for i in chunk])
+            logging.info(f"Found {len(result)} proxies with proxyrotator")
+            return result
+
+        @nofail(retries=3, failback_result=[])
+        def fetch_proxymesh():
+            proxies = [
+                # Proxy(username='idwangmo', password='951024001x', ip='fr.proxymesh.com', port=31280),
+                # Proxy(username='idwangmo', password='951024001x', ip='jp.proxymesh.com', port=31280),
+                Proxy(username='idwangmo', password='951024001x', ip='us-wa.proxymesh.com', port=31280),
+                Proxy(username='kevinbond', password='kevinbond', ip='us.proxymesh.com', port=31280),
+            ]
+            return proxies
+
+        @nofail(retries=30, failback_result=[])
+        def fetch_gimmeproxy():
+            result = []
+            import requests
+            for i in range(200):
+                logging.info(f'fetching froxy #{i} from gimmeproxy')
+                resp = requests.get(
+                    'https://gimmeproxy.com/api/getProxy?protocol=http&get=true&post=true&supportsHttps=true&api_key=5a1a1257-cf8a-4975-b2fb-f01f13a3d023').text
+                data = json.loads(resp)
+                result.append(
+                    Proxy(ip=data['ip'], port=int(data['port']), c_code=data['country'], country=data['country']))
+            logging.info(f"Found {len(result)} proxies with proxyrotator")
             return result
 
         @nofail(retries=3, failback_result=[])
@@ -332,12 +431,13 @@ class ProxyManager(object):
             logging.info(f"Found {len(result)} proxies with proxy_list")
             return result
 
-        all_found_proxies_result += fetch_proxydb()  # Bastards are blocking requests :(
-        all_found_proxies_result += fetch_clarketm()
-        all_found_proxies_result += fetch_a2u()
-        all_found_proxies_result += fetch_proxy_list()
+        all_found_proxies_result += fetch_proxymesh()
 
-        # all_found_proxies_result += fetch_proxynova() #it's just pretty dirty
+        # all_found_proxies_result += fetch_proxydb()  # Bastards are blocking requests :(
+        # all_found_proxies_result += await fetch_proxyrotator()
+        # all_found_proxies_result += fetch_a2u()
+        # all_found_proxies_result += fetch_proxy_list()
+        # all_found_proxies_result += fetch_proxynova()  # it's just pretty dirty
 
         all_found_proxies_result = list({f"{v.ip}:{v.port}": v for v in all_found_proxies_result}.values())
         with open(proxy_file_path, "w") as f:
@@ -353,7 +453,7 @@ class ProxyManager(object):
     def default_promote_fn(cls):
         return 0.2
 
-    def punish_proxy(self, proxy, e):
+    async def punish_proxy(self, proxy, e):
         pid = f"{proxy.ip}:{proxy.port}"
         penalty = self.penalty_fn(e)
         if pid not in self._punished_proxies:
@@ -361,14 +461,14 @@ class ProxyManager(object):
         else:
             self._punished_proxies[pid] += penalty
 
-        logging.debug(f"Giving panalty {pid}, now: {self._punished_proxies[pid]}")
-        for p in self._punished_proxies.items():
-            if p[1] > 10 and proxy in self._proxy_list:
-                self._proxy_list.remove(proxy)
-                logging.info(f"kicked proxy: {pid}, left: {len(self._proxy_list)}")
+        logging.debug(f"Giving penalty {pid}, now: {self._punished_proxies[pid]}, {e}")
+        if self._punished_proxies[pid] > 10 and proxy in self._proxy_list:
+            self._proxy_list.remove(proxy)
+            logging.info(f"kicked proxy: {pid}, left: {len(self._proxy_list)}")
+
         if not len(self._proxy_list):
             logging.info("Ran out of proxies, starting to fetch new ones...")
-            self.initialize_proxy_list(force=True)
+            await self.initialize_proxy_list()
 
     def promote_proxy(self, proxy):
         pid = f"{proxy.ip}:{proxy.port}"
@@ -380,23 +480,33 @@ class ProxyManager(object):
 
         logging.debug(f"Promoting {pid}, now: {self._punished_proxies[pid]}")
 
-    @classmethod
-    def initialize_proxy_list(cls, force=False):
-        if force or not hasattr(cls, '_proxy_list'):
-            cls._punished_proxies = {}
-            cls._proxy_list = cls.fetch_proxies(force=force)
+    async def initialize_proxy_list(self, force=True):
+        while self.initializing_proxies:
+            await asyncio.sleep(1)
+        if len(self._proxy_list):
+            return
 
-    def __init__(self, penalty_fn=None, promote_fn=None, force=False) -> None:
-        super().__init__()
-        self.current_proxy = None
-        self.initialize_proxy_list(force=force)
-        self.shuffle_proxy()
-        self.penalty_fn = penalty_fn if penalty_fn is not None else self.default_penalty_fn
-        self.promote_fn = promote_fn if promote_fn is not None else self.default_promote_fn
+        self.initializing_proxies = True
+        self._punished_proxies = {}
+        if not len(self._proxy_list):
+            self._proxy_list = await self.fetch_proxies(force=force)
+        self.initializing_proxies = False
+
+    def has_proxies(self):
+        return len(self._proxy_list) > 0
 
     def shuffle_proxy(self):
+        logging.debug("Shuffling proxy")
         self.current_proxy = self._proxy_list[random.randint(0, len(self._proxy_list) - 1)]
+        logging.debug(f"After Shuffling proxy: {self.current_proxy}")
 
 
-if __name__ == '__main__':
-    с = AsyncProxyClient()
+class UserCancelException(Exception):
+    pass
+
+
+class BadResponseCodeException(Exception):
+    def __init__(self, code) -> None:
+        super().__init__()
+        self.message = f"Bad HTTP response code: {code}"
+        self.code = code
