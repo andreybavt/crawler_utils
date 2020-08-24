@@ -13,15 +13,14 @@ from asyncio import CancelledError
 import jsonpickle
 import requests
 from bs4 import BeautifulSoup
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
 from tornado.httpclient import HTTPRequest
+from tornado.httputil import parse_cookie
 
 from crawler_utils.utils import nofail, nofail_async, chunks
 
 logging.basicConfig(stream=sys.stdout, level=os.environ.get('LOGLEVEL', 'INFO').upper(),
-                    format='%(name)s: %(asctime)s %(levelname)s %(message)s')
+                    format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 
 class TornadoLoggerFilter(logging.Filter):
@@ -37,6 +36,8 @@ logging.getLogger("tornado.application").addFilter(TornadoLoggerFilter())
 
 @nofail(retries=1)
 def create_browser():
+    from selenium import webdriver
+    from selenium.webdriver.chrome.options import Options
     chrome_options = Options()
     chrome_options.add_argument('--headless')
     chrome_options.add_argument('--no-sandbox')
@@ -50,17 +51,20 @@ def create_browser():
 class AsyncProxyClient(object):
     AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient')
 
-    def __init__(self, enable_proxy=True, penalty_fn=None, promote_fn=None, max_clients=50) -> None:
+    def __init__(self, enable_proxy=True, penalty_fn=None, promote_fn=None, max_clients=50,
+                 before_retry_callback=None) -> None:
         super().__init__()
+        self.shuffle_proxy_for_each_request = True
         self.fetch_opts = {}
         self.enable_proxy = enable_proxy
+        self.before_retry_callback = before_retry_callback
         if self.enable_proxy:
             self.proxy_manager = ProxyManager(penalty_fn, promote_fn)
-        self._client = CurlAsyncHTTPClient(max_clients=max_clients, defaults=dict(validate_cert=False))
+        self._client = CurlAsyncHTTPClient(max_clients=max_clients, defaults=dict(validate_cert=True))
 
-    @nofail_async()
     async def patient_fetch(self, request, proxy=None, use_proxy_for_request=True, redundancy=1, **kwargs):
-        return await self.impatient_fetch(request, proxy, use_proxy_for_request, redundancy, **kwargs)
+        impatient_fetch = nofail_async(before_retry_callback=self.before_retry_callback)(self.impatient_fetch)
+        return await impatient_fetch(request, proxy, use_proxy_for_request, redundancy, **kwargs)
 
     async def impatient_fetch(self, request, proxy=None, use_proxy_for_request=True, redundancy=1, **kwargs):
         res = await asyncio.wait(
@@ -75,8 +79,8 @@ class AsyncProxyClient(object):
         ok_statuses = set([200] + kwargs.get('ok_statuses', []))
         logging.debug(f"Sending {request.method} : {request.url}")
         if kwargs.get('cookies'):
-            cookies = request.headers.get('Cookie', '')
-            cookies += ';'.join([f'{i[0]}:{i[1]}' for i in kwargs.get('cookies').items()])
+            cookies = ';'.join([f'{i[0]}={i[1]}' for i in
+                                {**parse_cookie(request.headers.get('Cookie', '')), **kwargs.get('cookies')}.items()])
             request.headers['Cookie'] = cookies
         is_proxying = self.enable_proxy and use_proxy_for_request
         curr_proxy = None
@@ -84,7 +88,7 @@ class AsyncProxyClient(object):
             if is_proxying:
                 while not self.proxy_manager.has_proxies():
                     await asyncio.sleep(1)
-                self.proxy_manager.shuffle_proxy()
+                self.shuffle_proxy_for_each_request and self.proxy_manager.shuffle_proxy()
                 curr_proxy: Proxy = self.proxy_manager.current_proxy if not proxy else proxy
                 request.proxy_host = curr_proxy.ip
                 request.proxy_port = curr_proxy.port
@@ -100,22 +104,35 @@ class AsyncProxyClient(object):
 
             res = await self._client.fetch(request, raise_error=False)
             if res.code not in ok_statuses:
+                # not self.shuffle_proxy_for_each_request and self.proxy_manager.shuffle_proxy()
+                logging.error(f"BadResponseCodeException: {res.code}")
                 raise BadResponseCodeException(res.code)
             if is_proxying:
                 self.proxy_manager.promote_proxy(curr_proxy)
-            return res
+            return self.enhance_response(res)
         except CancelledError:
             pass
         except Exception as e:
+            if kwargs.get('error_handler'):
+                kwargs.get('error_handler')(e, self.proxy_manager, curr_proxy)
             if is_proxying:
                 await self.proxy_manager.punish_proxy(curr_proxy, e)
             raise e
+
+    def enhance_response(self, res):
+        import json as JSON
+
+        def json():
+            return JSON.loads(res.body.decode())
+
+        res.json = json
+        return res
 
 
 class Proxy(object):
     UNKNOWN = '¯\\_(ツ)_/¯'
 
-    def __init__(self, ip, port, c_code=UNKNOWN, country=UNKNOWN, username=None, password=None) -> None:
+    def __init__(self, ip: str, port: int, c_code=UNKNOWN, country=UNKNOWN, username=None, password=None) -> None:
         super().__init__()
         self.ip = ip
         self.port = port
@@ -126,6 +143,29 @@ class Proxy(object):
 
     def __repr__(self) -> str:
         return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True)
+
+    # def __eq__(self, o: object) -> bool:
+    #     if not isinstance(o, Proxy):
+    #         return False
+    #
+    #     return self.ip == o.ip and self.port == o.port
+
+
+class TorProxy(Proxy):
+
+    def __init__(self, ip, port=9050, api_port=9052) -> None:
+        super().__init__('socks5://' + ip, port, c_code="TOR", country="TOR", username=None, password=None)
+        self.api_port = api_port
+        self.tor_host_ip = ip
+        self.__proxy_data = self.reload()
+        self.country = self.__proxy_data['country']
+
+    def reload(self):
+        import requests
+        self.__proxy_data = requests.post(f'http://{self.tor_host_ip}:{self.api_port}/change').json()
+        self.country = self.__proxy_data['country']
+        logging.info("Reloaded TOR proxy, now: " + json.dumps(self.__proxy_data))
+        return self.__proxy_data
 
 
 class ProxyManager(object):
@@ -431,7 +471,11 @@ class ProxyManager(object):
             logging.info(f"Found {len(result)} proxies with proxy_list")
             return result
 
-        all_found_proxies_result += fetch_proxymesh()
+        # all_found_proxies_result += fetch_proxymesh()
+        all_found_proxies_result += [
+            # TorProxy('localhost')
+            Proxy("173.249.9.253", 8080, "AWS", "AWS", "admin", "awslambdaproxy")
+        ]
 
         # all_found_proxies_result += fetch_proxydb()  # Bastards are blocking requests :(
         # all_found_proxies_result += await fetch_proxyrotator()
@@ -498,6 +542,9 @@ class ProxyManager(object):
     def shuffle_proxy(self):
         logging.debug("Shuffling proxy")
         self.current_proxy = self._proxy_list[random.randint(0, len(self._proxy_list) - 1)]
+        if isinstance(self.current_proxy, TorProxy):
+            logging.debug(f"Reloading a TOR proxy")
+            self.current_proxy.reload()
         logging.debug(f"After Shuffling proxy: {self.current_proxy}")
 
 
@@ -510,3 +557,6 @@ class BadResponseCodeException(Exception):
         super().__init__()
         self.message = f"Bad HTTP response code: {code}"
         self.code = code
+
+    def __repr__(self) -> str:
+        return f"BadResponseCodeException(message={self.message}, code={self.code})"

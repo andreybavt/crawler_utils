@@ -10,11 +10,13 @@ import traceback
 from asyncio import Lock
 from functools import partial
 
+from telegram.error import RetryAfter
+
 SEPARATOR = '\n' + '-' * 100 + '\n'
 
 
 class PersistentSet:
-    def __init__(self, path='persistent-hash', buckets=2000, recreate=False):
+    def __init__(self, path='data/persistent-hash', buckets=2000, recreate=False):
         if recreate and os.path.exists(path):
             shutil.rmtree(path)
         self.locks = {}
@@ -137,7 +139,7 @@ def to_str(obj):
 UNDEFINED_FAILBACK_RESULT = "$^!#"
 
 
-def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
+def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT, before_retry_callback=None):
     def nofail_async_fn(func):
         async def func_wrapper(*args, **kwargs):
             r = 0
@@ -145,10 +147,12 @@ def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
             while r < retries:
                 r += 1
                 try:
+                    if r > 1 and before_retry_callback:
+                        args, kwargs = before_retry_callback(*args, **kwargs)
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
+                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
                     args_str = '\n\n'.join([to_str(a) for a in args])
 
                     logging.log(logging.DEBUG if r < retries else logging.WARN,
@@ -172,6 +176,8 @@ def nofail(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
                 r += 1
                 try:
                     return func(*args, **kwargs)
+                except RetryAfter as e:
+                    time.sleep(e.retry_after)
                 except Exception as e:
                     last_exception = e
                     logging.log(logging.DEBUG if r < retries else logging.WARN,

@@ -57,3 +57,5 @@ fabric.properties
 ghostdriver.log
 proxies.json
 env
+venv
+.pytest_cache
