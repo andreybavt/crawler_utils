@@ -9,15 +9,15 @@ import time
 import traceback
 import urllib.parse
 from asyncio import CancelledError
+from pathlib import Path
 
 import jsonpickle
 import requests
 from bs4 import BeautifulSoup
+from crawler_utils.utils import nofail, nofail_async, chunks
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
 from tornado.httpclient import HTTPRequest
 from tornado.httputil import parse_cookie
-
-from crawler_utils.utils import nofail, nofail_async, chunks
 
 logging.basicConfig(stream=sys.stdout, level=os.environ.get('LOGLEVEL', 'INFO').upper(),
                     format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -182,7 +182,7 @@ class ProxyManager(object):
     async def fetch_proxies(self, https_only=False, force=False):
         from datetime import date
         # proxy_file_path = os.path.join(os.path.dirname(__file__), "proxies.json")
-        proxy_file_path = "../proxies.json"
+        proxy_file_path = Path.home().joinpath('.proxies', 'proxies.json')
         all_found_proxies_result = []
         if not force and os.path.exists(proxy_file_path):
             with open(proxy_file_path, "r") as f:
