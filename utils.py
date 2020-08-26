@@ -152,7 +152,7 @@ def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT, before_r
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
-                    logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
+                    # logging.warning(f"@nofail_async: {func.__name__}, {r}/{retries}, {e}")
                     args_str = '\n\n'.join([to_str(a) for a in args])
 
                     logging.log(logging.DEBUG if r < retries else logging.WARN,
