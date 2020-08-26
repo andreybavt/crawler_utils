@@ -14,10 +14,12 @@ from pathlib import Path
 import jsonpickle
 import requests
 from bs4 import BeautifulSoup
-from crawler_utils.utils import nofail, nofail_async, chunks
+from prometheus_client import Counter
 from tornado.curl_httpclient import AsyncHTTPClient, CurlAsyncHTTPClient
 from tornado.httpclient import HTTPRequest
 from tornado.httputil import parse_cookie
+
+from crawler_utils.utils import nofail, nofail_async, chunks
 
 logging.basicConfig(stream=sys.stdout, level=os.environ.get('LOGLEVEL', 'INFO').upper(),
                     format='%(asctime)s %(levelname)s %(name)s: %(message)s')
@@ -50,14 +52,29 @@ def create_browser():
 
 class AsyncProxyClient(object):
     AsyncHTTPClient.configure('tornado.curl_httpclient.CurlAsyncHTTPClient')
+    METRIC_RETRIED_REQUESTS: Counter = None
 
     def __init__(self, enable_proxy=True, penalty_fn=None, promote_fn=None, max_clients=50,
-                 before_retry_callback=None) -> None:
+                 before_retry_callback=None, monitoring=False) -> None:
         super().__init__()
+
         self.shuffle_proxy_for_each_request = True
         self.fetch_opts = {}
         self.enable_proxy = enable_proxy
         self.before_retry_callback = before_retry_callback
+        if monitoring:
+            from prometheus_client import Counter
+            from urllib.parse import urlparse
+            if not AsyncProxyClient.METRIC_RETRIED_REQUESTS:
+                AsyncProxyClient.METRIC_RETRIED_REQUESTS = Counter("async_proxy_client_retried_requests",
+                                                                   "Number of retried requests", ['host'])
+
+            def _before_retry_callback(*args, **kwargs):
+                AsyncProxyClient.METRIC_RETRIED_REQUESTS.labels(urlparse(args[0].url).hostname).inc()
+                before_retry_callback and before_retry_callback(*args, **kwargs)
+
+            self.before_retry_callback = _before_retry_callback
+
         if self.enable_proxy:
             self.proxy_manager = ProxyManager(penalty_fn, promote_fn)
         self._client = CurlAsyncHTTPClient(max_clients=max_clients, defaults=dict(validate_cert=True))
@@ -484,6 +501,8 @@ class ProxyManager(object):
         # all_found_proxies_result += fetch_proxynova()  # it's just pretty dirty
 
         all_found_proxies_result = list({f"{v.ip}:{v.port}": v for v in all_found_proxies_result}.values())
+        if not os.path.exists(os.path.dirname(proxy_file_path)):
+            os.makedirs(os.path.dirname(proxy_file_path))
         with open(proxy_file_path, "w") as f:
             f.write(jsonpickle.encode({"date": str(date.today()), "proxies": all_found_proxies_result}))
 
