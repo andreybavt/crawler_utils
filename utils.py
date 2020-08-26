@@ -167,7 +167,7 @@ def nofail_async(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT, before_r
     return nofail_async_fn
 
 
-def nofail(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
+def nofail(retries=20, sleep=None, failback_result=UNDEFINED_FAILBACK_RESULT):
     def nofail_fn(func):
         def func_wrapper(*args, **kwargs):
             r = 0
@@ -182,6 +182,8 @@ def nofail(retries=20, failback_result=UNDEFINED_FAILBACK_RESULT):
                     last_exception = e
                     logging.log(logging.DEBUG if r < retries else logging.WARN,
                                 f"@nofail_async: {func.__name__}, {r}/{retries}, {e}\n{traceback.format_exc()}")
+                    if sleep:
+                        time.sleep(sleep)
                     # logging.warning()
             if failback_result is not UNDEFINED_FAILBACK_RESULT:
                 return failback_result
