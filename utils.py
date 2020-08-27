@@ -177,6 +177,7 @@ def nofail(retries=20, sleep=None, failback_result=UNDEFINED_FAILBACK_RESULT):
                 try:
                     return func(*args, **kwargs)
                 except RetryAfter as e:
+                    logging.info(f"Telegram.RetryAfter: sleeping for {e.retry_after} sec before retrying")
                     time.sleep(e.retry_after)
                 except Exception as e:
                     last_exception = e
