@@ -142,6 +142,9 @@ class AsyncProxyClient(object):
         def json():
             return JSON.loads(res.body.decode())
 
+        def text():
+            return res.body.decode('utf-8')
+
         res.json = json
         return res
 
@@ -490,8 +493,8 @@ class ProxyManager(object):
 
         # all_found_proxies_result += fetch_proxymesh()
         all_found_proxies_result += [
-            # TorProxy('localhost')
-            Proxy("173.249.9.253", 8080, "AWS", "AWS", "admin", "awslambdaproxy")
+            TorProxy(os.environ.get('TOR_PROXY_HOST', 'localhost'))
+            # Proxy("173.249.9.253", 8080, "AWS", "AWS", "admin", "awslambdaproxy")
         ]
 
         # all_found_proxies_result += fetch_proxydb()  # Bastards are blocking requests :(
